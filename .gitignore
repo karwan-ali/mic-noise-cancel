@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build output
+build/
+dist/
+*.spec
+
+# Personal and machine-local files
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+
+# RNNoise binaries are dropped in by the user, never shipped
+rnnoise.dll
+librnnoise*.dll
+rnnoise/

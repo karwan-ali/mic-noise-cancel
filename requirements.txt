@@ -1,0 +1,4 @@
+numpy>=1.21
+sounddevice>=0.4.5
+pystray>=0.19.4
+Pillow>=9.0
