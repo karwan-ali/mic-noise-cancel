@@ -33,6 +33,14 @@ use nnnoiseless::DenoiseState;
 pub const HOP: usize = 480; // 10 ms at 48 kHz
 const SAMPLE_RATE: usize = 48000;
 const RNNOISE_SCALE: f32 = 32768.0; // RNNoise works on int16-ranged floats
+/// Local-SNR thresholds (dB) that pick DeepFilterNet's stages per frame:
+/// below the first a frame is muted outright, above the second it passes
+/// untouched, above the third the deep-filtering stage that rebuilds the
+/// voice's harmonics is skipped. These are the values DeepFilterNet's own
+/// `deep-filter` program uses. The library's `RuntimeParams::default()`
+/// (-10, 30, 20) muted about a third of the frames of real speech, which
+/// sounded like distortion that grew with the attenuation limit.
+const STAGE_THRESHOLDS_DB: (f32, f32, f32) = (-15.0, 35.0, 35.0);
 /// How much audio may wait for the worker before new samples are dropped.
 /// Far more than it ever needs; it only bounds memory if the thread stalls.
 const FEED_CAPACITY: usize = SAMPLE_RATE / 2;
@@ -117,10 +125,15 @@ impl DeepFilter {
     /// Build the DeepFilterNet 3 model embedded in the program. Parsing and
     /// optimising its three ONNX graphs takes a few hundred milliseconds.
     pub fn load() -> Result<Self, String> {
+        Self::load_with(STAGE_THRESHOLDS_DB)
+    }
+
+    fn load_with((min_db, max_erb_db, max_df_db): (f32, f32, f32)) -> Result<Self, String> {
         // The archive is compiled in (the crate's "default-model" feature), so
         // unpacking it either always works or fails every test run.
         let params = DfParams::default();
-        let model = DfTract::new(params, &RuntimeParams::default_with_ch(1)).map_err(|e| format!("{e:#}"))?;
+        let runtime = RuntimeParams::default_with_ch(1).with_thresholds(min_db, max_erb_db, max_df_db);
+        let model = DfTract::new(params, &runtime).map_err(|e| format!("{e:#}"))?;
         if model.hop_size != HOP || model.sr != SAMPLE_RATE {
             return Err(format!("model runs at {} Hz with a {}-sample hop, expected 48000 Hz and {HOP}", model.sr, model.hop_size));
         }
@@ -411,6 +424,47 @@ mod tests {
             assert!(speech.abs() < 8.0, "{room}: speech {speech:+.1} dB");
             assert!(y.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
         }
+    }
+
+    /// SI-SDR (dB) of DeepFilterNet's output against the clean speech, at
+    /// one attenuation limit: how much of what comes out is the voice.
+    fn fidelity(make: &dyn Fn() -> DeepFilter, scene: &Scene, lim: f32) -> f32 {
+        let mut d = make();
+        d.set_atten_lim(lim);
+        let delay = (d.delay_ms() * 48.0).round() as usize;
+        let y = run(&mut |h| d.process(h), &scene.mixed);
+        let y = &y[delay..];
+        let c = &scene.clean[..y.len()];
+        let dot: f64 = y.iter().zip(c).map(|(&a, &b)| a as f64 * b as f64).sum();
+        let cc: f64 = c.iter().map(|&b| b as f64 * b as f64).sum();
+        let a = dot / cc;
+        let err: f64 = y.iter().zip(c).map(|(&y, &c)| (y as f64 - a * c as f64).powi(2)).sum();
+        (10.0 * ((a * a * cc) / err).log10()) as f32
+    }
+
+    /// Every frame gets both stages. The model's SNR estimate spans -15 to
+    /// 35 dB, so these thresholds never mute a frame or skip a stage; the
+    /// library defaults skipped deep filtering on loud, clean speech.
+    #[test]
+    fn deep_filter_never_skips_a_stage() {
+        let d = DeepFilter::load().unwrap();
+        for lsnr in (-15..=35).map(|x| x as f32) {
+            assert_eq!(d.model.apply_stages(lsnr), (true, false, true), "at {lsnr} dB local SNR");
+        }
+    }
+
+    /// Loud, clean speech must survive full attenuation. With the library's
+    /// default stage thresholds it did not: frames over 20 dB local SNR
+    /// skipped deep filtering, distorting exactly the vowels you hear best,
+    /// and only the noisy signal mixed back in at a low limit hid it.
+    #[test]
+    fn loud_speech_is_not_distorted_at_full_attenuation() {
+        let scene = make_scene(0.008, 13); // headset: loud speech, little noise
+        let now = fidelity(&|| DeepFilter::load().unwrap(), &scene, 100.0);
+        let old = fidelity(&|| DeepFilter::load_with((-10.0, 30.0, 20.0)).unwrap(), &scene, 100.0);
+        eprintln!("loud speech at full attenuation: SI-SDR {now:.1} dB, {old:.1} dB with the library defaults");
+        assert!(now >= 9.0, "speech SI-SDR {now:.1} dB");
+        assert!(now > old + 4.0, "the test no longer tells the old thresholds apart ({now:.1} vs {old:.1} dB)");
     }
 
     #[test]
