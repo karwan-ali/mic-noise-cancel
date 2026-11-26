@@ -46,9 +46,10 @@ nothing else to download.
 
 **Get the program** in one of two ways:
 
-- **Download it:** open the repository's *Actions* tab on GitHub, pick the
-  latest *Build* run and download the `MicNoiseCancel` artifact. It's a zip with
-  the .exe inside.
+- **Download it:** get `MicNoiseCancel.exe` from the
+  [latest release](https://github.com/karwan-ali/mic-noise-cancel/releases/latest).
+  Windows may show a SmartScreen warning the first time, because the program
+  isn't signed. Click *More info → Run anyway*.
 - **Build it yourself:** install Rust from <https://rustup.rs> (the default
   options are fine, including the Visual Studio C++ build tools it offers), then
   run this in the repository folder:
