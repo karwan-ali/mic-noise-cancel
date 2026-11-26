@@ -102,6 +102,7 @@ Right-click the icon:
 |---|---|
 | **Noise reduction on** | Turns processing on and off. Off passes the audio straight through. |
 | **Level** | Light, Balanced or Aggressive. |
+| **Neural network** | Off, RNNoise or DeepFilterNet: the network that cleans the audio first. See [Neural networks](#neural-networks). |
 | **Microphone** | Which microphone is read. |
 | **Send to** | Where the cleaned audio goes, normally *CABLE Input*. |
 | **Monitor in headphones** | Lets you hear the result yourself. Useful while tuning, but turn it off afterwards. |
@@ -137,6 +138,8 @@ The **Advanced** tab has the controls behind the levels:
 | **Voice threshold** | How much speech it takes to open the gate. **This is the one to try first** if something sounds wrong. |
 | **Hold time** | How long the gate stays open after the last syllable. |
 | **Attack / release** | How quickly the gate opens and closes. |
+| **Neural network** | Off, RNNoise (light) or DeepFilterNet (best). See [Neural networks](#neural-networks). |
+| **Max reduction (DFN)** | How far DeepFilterNet may push the noise down. 100 dB means no limit. Only used with DeepFilterNet. |
 
 Changes are heard immediately. Everything is saved in
 `%APPDATA%\MicNoiseCancel\config.json`, with the log next to it as `app.log`.
@@ -150,6 +153,10 @@ Esc or *Close* closes the window; the app keeps running in the tray.
 - **The voice sounds hollow or watery:** lower *Reduction strength* to
   18-22 dB, or pick Balanced.
 - **There's a click when the gate opens:** raise *Attack* to 15-20 ms.
+- **Barking, clatter or chatter gets through:** pick *DeepFilterNet* as the
+  neural network.
+- **The voice sounds thin or robotic with DeepFilterNet:** lower *Max
+  reduction (DFN)* to 20-30 dB, so a little of the room is left in.
 
 ---
 
@@ -157,6 +164,8 @@ Esc or *Close* closes the window; the app keeps running in the tray.
 
 Audio is processed in 10 ms blocks at 48 kHz. For each block:
 
+0. **Neural network** (RNNoise or DeepFilterNet, if one is chosen) removes
+   what it recognises as noise. See [Neural networks](#neural-networks).
 1. **High-pass filter** removes rumble below about 90 Hz.
 2. **Noise estimate.** A sliding minimum per frequency band over 1.6 seconds
    tracks the background level. The gaps between syllables expose the floor, so
@@ -185,14 +194,44 @@ speech kept within 1-3 dB of the clean signal, and the gate opening 20-40 ms
 after speech starts. Latency is about 50 ms, and processing takes about
 0.01 ms per 10 ms block, roughly a thousand times faster than real time.
 
-### RNNoise
+### Neural networks
 
-RNNoise is a small neural network that handles uneven noise like keyboards,
-paper and traffic better than classic signal processing does. It's built into
-the program (as [nnnoiseless](https://github.com/jneem/nnnoiseless), a Rust
-port of [Xiph's rnnoise](https://github.com/xiph/rnnoise)) and runs before the
-app's own noise reduction. It's on by default. If your voice sounds odd with it,
-or the computer is very slow, untick *Use RNNoise* under *Settings → Advanced*.
+Before the steps above, a neural network can clean the audio. Two are built
+into the program, and you pick one under *Settings → Advanced → Neural network*
+or in the tray menu:
+
+| | RNNoise (default) | DeepFilterNet |
+|---|---|---|
+| Good at | steady noise, keyboards, paper, traffic | all of that, plus barking dogs, dishes, running water and background chatter |
+| CPU per 10 ms block | about 0.07 ms | about 1 ms |
+| Extra latency | none (counted in the 50 ms) | about 20 ms |
+| Memory | under 1 MB | about 40 MB, only while it's selected |
+
+**RNNoise** is a small network, built in as
+[nnnoiseless](https://github.com/jneem/nnnoiseless), a Rust port of
+[Xiph's rnnoise](https://github.com/xiph/rnnoise).
+
+**DeepFilterNet** is [DeepFilterNet 3](https://github.com/Rikorose/DeepFilterNet)
+by Hendrik Schröter, a much larger network, run with the
+[tract](https://github.com/sonos/tract) inference engine. The model ships
+inside the .exe, so there's still nothing extra to download. On the test
+suite's synthetic speech it takes the background down by 26-29 dB on its own,
+with speech within 1-4 dB of the clean signal. The app's own noise reduction
+and gate still run after it. *Max reduction (DFN)* caps how far it pushes the
+noise down: at 100 dB there's no cap, and 20-30 dB leaves a trace of the room,
+which some people find sounds more natural. The slider works while you talk.
+(CPU figures are from the test suite on a 4-core cloud machine.)
+
+DeepFilterNet doesn't run in the audio callback like everything else does. Its
+model state can't be moved between threads, so it gets a high-priority thread
+of its own: the microphone callback hands each block over and that thread runs
+the whole chain. The model loads in about 0.2 seconds when you select it, stays
+loaded while it's selected (switching devices doesn't load it again), and is
+unloaded, thread and memory both, when you pick something else. If it ever
+fails to load, the app falls back to RNNoise and says so in `app.log`.
+
+Choose *Off* if your voice sounds odd with either network, or the computer is
+very slow.
 
 ### Memory
 
@@ -202,7 +241,9 @@ GUI framework and no browser engine. A few things keep it small:
 - The **settings window only exists while it's open.** Closing it destroys
   every control and hands the memory back to Windows.
 - **Audio buffers are allocated once** when the streams open. The audio
-  callbacks never allocate, which also keeps them free of hiccups.
+  callbacks never allocate, which also keeps them free of hiccups. (The
+  DeepFilterNet thread is the exception: tract allocates a little as it runs,
+  which is one reason it has a thread of its own.)
 - **RNNoise's network weights are read straight from the program file** (87 KB)
   instead of being copied into memory.
 - **Icons are drawn in code** at exactly the size the taskbar asks for.
@@ -243,10 +284,17 @@ cargo test --release
   preservation in two kinds of room, gate behaviour and onset latency, the
   limiter, live parameter changes, and robustness against silence and
   overdriven input.
+- **Neural networks:** DeepFilterNet loads, removes noise and keeps speech in
+  both rooms, respects its attenuation limit (also when it changes mid-stream),
+  survives silence and full-scale input, and runs well faster than real time.
+  Its worker thread runs back-to-back sessions, delivers every block, drops
+  audio rather than growing if it falls behind, and shuts down cleanly.
+  RNNoise and *Off* behave as before.
 - **Ring buffer and resampler:** wrap-around, overflow, drift trimming and
   padding, and rate accuracy.
-- **Settings:** presets, and reading the JSON file the Python version wrote,
-  including bad values.
+- **Settings:** presets, the neural network choice (including files written
+  before DeepFilterNet was added), and reading the JSON file the Python version
+  wrote, including bad values.
 - **Translations:** every string has both languages, with matching
   placeholders. A string missing in one language doesn't even compile.
 
@@ -265,7 +313,8 @@ src/
   main.rs           entry point
   app.rs            ties it all together: tray menu, startup, the UI thread
   dsp.rs            noise reduction, speech detection, noise gate
-  engine.rs         audio streams, RNNoise, ring buffers, watchdog
+  engine.rs         audio streams, ring buffers, watchdog
+  neural.rs         RNNoise, DeepFilterNet and the DeepFilterNet worker thread
   ring.rs           ring buffer with clock-drift correction
   resample.rs       resampling for microphones that don't run at 48 kHz
   devices.rs        device discovery and virtual cable detection
@@ -292,3 +341,7 @@ through the table.
 ## License
 
 [MIT](LICENSE). Use it, change it and ship it, just keep the copyright notice.
+
+The built-in DeepFilterNet code and model are by Hendrik Schröter and are
+dual-licensed under MIT and Apache-2.0; see the
+[DeepFilterNet repository](https://github.com/Rikorose/DeepFilterNet).

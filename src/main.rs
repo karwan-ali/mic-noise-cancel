@@ -11,6 +11,7 @@ mod dsp;
 mod i18n;
 mod icon_draw;
 mod log;
+mod neural;
 mod resample;
 mod ring;
 #[cfg(test)]

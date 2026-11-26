@@ -162,6 +162,10 @@ strings! {
     // ------------------------------------------------------------ tray
     TrayEnabled => "Brusreducering på", "Noise reduction on";
     TrayLevel => "Nivå", "Level";
+    TrayNeural => "Neuralt nätverk", "Neural network";
+    NeuralOff => "Av", "Off";
+    NeuralRnnoise => "RNNoise (lätt)", "RNNoise (light)";
+    NeuralDeepFilterNet => "DeepFilterNet (bäst)", "DeepFilterNet (best)";
     TrayMicrophone => "Mikrofon", "Microphone";
     TraySendTo => "Skicka till", "Send to";
     TrayMonitor => "Medhörning i hörlurar", "Monitor in headphones";
@@ -238,12 +242,8 @@ strings! {
         "Hover over a slider to see what it does and when it is worth changing.";
 
     SettingsOther => "Övrigt", "Other";
-    SettingsUseRnnoise =>
-        "Använd RNNoise (neuralt nätverk) som första steg",
-        "Use RNNoise (neural network) as a first stage";
-    SettingsRnnoiseHint =>
-        "Inbyggt i appen. Tar ojämnt brus som tangentbord och papper, kostar lite mer processor.",
-        "Built into the app. Handles uneven noise like keyboards and paper, costs a little more CPU.";
+    SettingsNeural => "Neuralt nätverk", "Neural network";
+    SettingsDeepFilterLimit => "Max dämpning (DFN)", "Max reduction (DFN)";
     SettingsOpenLogs => "Öppna loggmapp", "Open log folder";
     SettingsReset => "Återställ standard", "Reset to defaults";
 
@@ -406,15 +406,30 @@ strings! {
          långsamt låter mjukare men släpper igenom lite mer.",
         "How quickly the gate closes after you stop speaking.\n\nFast gives a more abrupt \
          silence; slow sounds smoother but lets a little more through.";
-    HelpUseRnnoise =>
-        "Använder RNNoise, ett litet neuralt nätverk, före appens egen brusreducering. \
-         Det tar ojämnt brus - tangentbord, papper, trafik - bättre än klassisk \
-         signalbehandling.\n\nStäng av om rösten låter konstig eller om datorn är \
-         mycket svag.",
-        "Runs RNNoise, a small neural network, before the app's own noise reduction. It \
-         handles uneven noise - keyboards, paper, traffic - better than classic signal \
-         processing.\n\nTurn it off if your voice sounds odd or the computer is very \
-         slow.";
+    HelpNeural =>
+        "Ett neuralt nätverk som rensar ljudet före appens egen brusreducering. Båda \
+         är inbyggda i appen.\n\nRNNoise: litet och nästan gratis. Tar ojämnt brus - \
+         tangentbord, papper, trafik - bättre än klassisk signalbehandling.\n\n\
+         DeepFilterNet: ett mycket större nätverk som också tar hundskall, rinnande \
+         vatten, disk och sorl i bakgrunden. Kostar ungefär en millisekund processortid \
+         per 10 ms ljud och lägger till cirka 20 ms fördröjning.\n\nAv: bara appens \
+         egen brusreducering. Prova om rösten låter konstig eller datorn är mycket svag.",
+        "A neural network that cleans the audio before the app's own noise reduction. \
+         Both are built into the app.\n\nRNNoise: small and nearly free. Handles uneven \
+         noise - keyboards, paper, traffic - better than classic signal processing.\n\n\
+         DeepFilterNet: a much larger network that also takes barking dogs, running \
+         water, dishes and chatter in the background. Costs about a millisecond of CPU \
+         per 10 ms of audio and adds roughly 20 ms of delay.\n\nOff: only the app's own \
+         noise reduction. Try it if your voice sounds odd or the computer is very slow.";
+    HelpDeepFilterLimit =>
+        "Hur mycket DeepFilterNet högst får dämpa bruset. 100 dB betyder ingen gräns.\n\n\
+         Sänk till 20-30 dB om rösten låter tunn eller robotaktig: lite bakgrund får \
+         då vara kvar, och rösten låter naturligare. Gäller bara när DeepFilterNet är \
+         valt.",
+        "The most DeepFilterNet may reduce the noise. 100 dB means no limit.\n\nLower it \
+         to 20-30 dB if your voice sounds thin or robotic: a little background is then \
+         left in, and the voice sounds more natural. Only applies when DeepFilterNet is \
+         selected.";
     HelpOpenLogs =>
         "Öppnar mappen med config.json och app.log. Loggen är första stället att titta \
          om något inte fungerar.",

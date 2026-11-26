@@ -10,12 +10,14 @@ use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPAR
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::*;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::{preset_label, trim_working_set, with_app, App};
+use crate::app::{neural_label, preset_label, trim_working_set, with_app, App};
 use crate::config::{self, Config, Preset, APP_TITLE, VERSION};
 use crate::devices::{self, Kind};
 use crate::i18n::{self, t, tf, Lang, S};
+use crate::neural::NeuralModel;
 use crate::win::{self, wide, MessageKind};
 use crate::{autostart, shortcut};
 
@@ -40,9 +42,9 @@ const ID_LANG: i32 = 1101;
 const ID_IN: i32 = 1102;
 const ID_OUT: i32 = 1103;
 const ID_MON: i32 = 1104;
+const ID_NEURAL: i32 = 1105;
 const ID_MONITOR: i32 = 1201;
 const ID_GATE: i32 = 1202;
-const ID_RNNOISE: i32 = 1203;
 const ID_AUTOSTART: i32 = 1204;
 const ID_PRESET: i32 = 1301;
 const ID_TAB: i32 = 1401;
@@ -112,7 +114,7 @@ macro_rules! slider {
     };
 }
 
-const SLIDERS: [SliderDef; 10] = [
+const SLIDERS: [SliderDef; 11] = [
     slider!(monitor_gain_db, SettingsMonitorVolume, HelpMonitorGain, -40.0, 6.0, "dB", false, GENERAL),
     slider!(reduction_db, SettingsReduction, HelpReduction, 6.0, 45.0, "dB", false, ADVANCED),
     slider!(highpass_hz, SettingsHighpass, HelpHighpass, 20.0, 200.0, "Hz", true, ADVANCED),
@@ -123,7 +125,9 @@ const SLIDERS: [SliderDef; 10] = [
     slider!(vad_hangover_ms, SettingsHangover, HelpHangover, 50.0, 700.0, "ms", true, ADVANCED),
     slider!(gate_attack_ms, SettingsAttack, HelpAttack, 1.0, 60.0, "ms", true, ADVANCED),
     slider!(gate_release_ms, SettingsRelease, HelpRelease, 30.0, 800.0, "ms", true, ADVANCED),
+    slider!(deepfilter_limit_db, SettingsDeepFilterLimit, HelpDeepFilterLimit, 6.0, 100.0, "dB", true, ADVANCED),
 ];
+const SLIDER_DEEPFILTER: usize = 10;
 
 impl SliderDef {
     fn scale(&self) -> f32 {
@@ -188,7 +192,8 @@ pub struct SettingsWindow {
     speech_state: Option<bool>,
     monitor_check: HWND,
     gate_check: HWND,
-    rnnoise_check: HWND,
+    neural_combo: HWND,
+    deepfilter_track: HWND,
     autostart_check: HWND,
     shortcut_button: HWND,
     sliders: Vec<Slider>,
@@ -558,7 +563,8 @@ impl App {
             speech_state: None,
             monitor_check: std::ptr::null_mut(),
             gate_check: std::ptr::null_mut(),
-            rnnoise_check: std::ptr::null_mut(),
+            neural_combo: std::ptr::null_mut(),
+            deepfilter_track: std::ptr::null_mut(),
             autostart_check: std::ptr::null_mut(),
             shortcut_button: std::ptr::null_mut(),
             sliders: Vec::new(),
@@ -606,7 +612,7 @@ impl App {
 
     /// Push the config into the controls. Setting a control's state by
     /// message sends no notification, so nothing here re-triggers an apply.
-    fn load_values(&mut self) {
+    pub(crate) fn load_values(&mut self) {
         let cfg = self.cfg.clone();
         let Some(s) = &mut self.settings else { return };
         select_combo(s.in_combo, &s.in_list, cfg.input_device.as_deref());
@@ -614,7 +620,8 @@ impl App {
         select_combo(s.mon_combo, &s.out_list, cfg.monitor_device.as_deref());
         set_check(s.monitor_check, cfg.monitor_enabled);
         set_check(s.gate_check, cfg.gate_enabled);
-        set_check(s.rnnoise_check, cfg.use_rnnoise);
+        let neural = NeuralModel::ALL.iter().position(|&m| m == cfg.neural_model()).unwrap_or(0);
+        unsafe { SendMessageW(s.neural_combo, CB_SETCURSEL, neural, 0) };
         set_check(s.autostart_check, autostart::is_enabled());
         for slider in &s.sliders {
             let v = (slider.def.get)(&cfg);
@@ -622,8 +629,22 @@ impl App {
             set_text(slider.value, &slider.def.format(v));
         }
         self.sync_presets();
+        self.sync_neural();
         self.update_cable_hint();
         self.refresh_shortcut_button();
+    }
+
+    fn selected_neural(&self) -> Option<NeuralModel> {
+        let s = self.settings.as_ref()?;
+        let index = unsafe { SendMessageW(s.neural_combo, CB_GETCURSEL, 0, 0) };
+        usize::try_from(index).ok().and_then(|i| NeuralModel::ALL.get(i).copied())
+    }
+
+    /// The DeepFilterNet limit only means something while it is selected.
+    fn sync_neural(&mut self) {
+        let on = self.selected_neural() == Some(NeuralModel::DeepFilterNet);
+        let Some(s) = &self.settings else { return };
+        unsafe { EnableWindow(s.deepfilter_track, on as i32) };
     }
 
     fn sync_presets(&mut self) {
@@ -645,7 +666,9 @@ impl App {
         cfg.monitor_device = combo_value(s.mon_combo, &s.out_list).or(cfg.monitor_device);
         cfg.monitor_enabled = get_check(s.monitor_check);
         cfg.gate_enabled = get_check(s.gate_check);
-        cfg.use_rnnoise = get_check(s.rnnoise_check);
+        if let Some(model) = self.selected_neural() {
+            cfg.set_neural_model(model);
+        }
         for slider in &s.sliders {
             let pos = unsafe { SendMessageW(slider.track, TBM_GETPOS, 0, 0) };
             (slider.def.set)(&mut cfg, slider.def.value_at(pos));
@@ -706,8 +729,11 @@ impl App {
             (t(S::StatusBypassed), COL_WARN, t(S::SettingsStatusBypassed).to_string())
         } else {
             let info = &status.info;
-            let rn = if status.rnnoise { ", RNNoise" } else { "" };
-            (t(S::StatusActive), COL_OK, format!("{}  ->  {}   (~{:.0} ms{rn})", info.input_name, info.output_name, info.latency_ms))
+            let neural = match status.neural {
+                NeuralModel::Off => String::new(),
+                m => format!(", {m}"),
+            };
+            (t(S::StatusActive), COL_OK, format!("{}  ->  {}   (~{:.0} ms{neural})", info.input_name, info.output_name, info.latency_ms))
         };
         if s.status_text.0 != head || s.status_text.1 != hint || STATUS_COLOR.with(Cell::get) != colour {
             STATUS_COLOR.with(|c| c.set(colour));
@@ -877,21 +903,28 @@ fn build_controls(w: &mut SettingsWindow) {
     b.page = ADVANCED;
     b.group(t(S::SettingsGate), x0, y, gw, 214);
     b.w.gate_check = b.check(t(S::SettingsGateEnabled), ix, y + 20, iw, ID_GATE, S::HelpGateEnabled);
-    for (i, def) in SLIDERS[5..].iter().enumerate() {
+    for (i, def) in SLIDERS[5..SLIDER_DEEPFILTER].iter().enumerate() {
         b.slider(def, ix, y + 44 + i as i32 * 27, iw);
     }
     b.page = ADVANCED;
     b.hint(t(S::SettingsHoverSliders), ix, y + 180, iw, 30);
     y += 214 + gap;
 
-    b.group(t(S::SettingsOther), x0, y, gw, 104);
-    b.w.rnnoise_check = b.check(t(S::SettingsUseRnnoise), ix, y + 20, iw, ID_RNNOISE, S::HelpUseRnnoise);
-    b.hint(t(S::SettingsRnnoiseHint), ix + 18, y + 42, iw - 18, 30);
-    b.button(t(S::SettingsOpenLogs), ix, y + 72, 150, ID_OPEN_LOGS, S::HelpOpenLogs);
-    b.button(t(S::SettingsReset), ix + 158, y + 72, 150, ID_RESET, S::HelpReset);
+    b.group(t(S::SettingsOther), x0, y, gw, 106);
+    b.label(t(S::SettingsNeural), ix, y + 23, 150, 18, Some(S::HelpNeural));
+    let neural = b.combo(ix + 156, y + 19, iw - 156, ID_NEURAL, S::HelpNeural);
+    for m in NeuralModel::ALL {
+        unsafe { SendMessageW(neural, CB_ADDSTRING, 0, wide(t(neural_label(m))).as_ptr() as LPARAM) };
+    }
+    b.w.neural_combo = neural;
+    b.slider(&SLIDERS[SLIDER_DEEPFILTER], ix, y + 46, iw);
+    b.w.deepfilter_track = b.w.sliders.last().map(|sl| sl.track).unwrap_or(std::ptr::null_mut());
+    b.page = ADVANCED;
+    b.button(t(S::SettingsOpenLogs), ix, y + 74, 150, ID_OPEN_LOGS, S::HelpOpenLogs);
+    b.button(t(S::SettingsReset), ix + 158, y + 74, 150, ID_RESET, S::HelpReset);
     let version = format!("{APP_TITLE} {VERSION}");
-    b.make("STATIC", &version, SS_RIGHT, ix + 316, y + 77, iw - 316, 18, ID_MUTED, None);
-    debug_assert!(y + 104 <= tab_bottom - 8);
+    b.make("STATIC", &version, SS_RIGHT, ix + 316, y + 79, iw - 316, 18, ID_MUTED, None);
+    debug_assert!(y + 106 <= tab_bottom - 8);
 
     // ------------------------------------------------------------ Bottom
     b.page = ALWAYS;
@@ -1092,8 +1125,14 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 win::message(hwnd, t(S::SettingsAutostartFailed), MessageKind::Warning);
             }
         }
-        (ID_MONITOR | ID_RNNOISE, BN_CLICKED_CODE) => {
+        (ID_MONITOR, BN_CLICKED_CODE) => {
             with_app(|app| app.schedule_apply(50));
+        }
+        (ID_NEURAL, CBN_SELCHANGE_CODE) => {
+            with_app(|app| {
+                app.sync_neural();
+                app.schedule_apply(50);
+            });
         }
         (ID_GATE, BN_CLICKED_CODE) => {
             with_app(|app| app.schedule_apply(180));
