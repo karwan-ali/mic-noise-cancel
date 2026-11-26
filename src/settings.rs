@@ -165,7 +165,11 @@ pub struct SettingsWindow {
     apply_pending: bool,
     scale: f32,
     tab: HWND,
-    pages: Vec<(HWND, u8)>,
+    // One child window per tab, holding that tab's controls. Each paints its
+    // own background, so switching tabs never leaves the other tab's pixels
+    // behind (inside a group box nothing else would repaint them).
+    page_windows: [HWND; 2],
+    page_origin: [(i32, i32); 2], // in pixels, relative to the window
     status: HWND,
     status_hint: HWND,
     status_text: (String, String),
@@ -207,27 +211,32 @@ impl Builder<'_> {
         (v as f32 * self.w.scale).round() as i32
     }
 
+    /// Create a control. Coordinates are relative to the window; controls on
+    /// a tab are placed on that tab's page window, offset to match.
     #[allow(clippy::too_many_arguments)]
     fn make(&mut self, class: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32, tip: Option<S>) -> HWND {
         let (class_w, text_w) = (wide(class), wide(text));
+        let (parent, (ox, oy)) = match self.page {
+            ALWAYS => (self.w.hwnd, (0, 0)),
+            p => (self.w.page_windows[p as usize], self.w.page_origin[p as usize]),
+        };
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
                 class_w.as_ptr(),
                 text_w.as_ptr(),
                 WS_CHILD | WS_VISIBLE | style,
-                self.s(x),
-                self.s(y),
+                self.s(x) - ox,
+                self.s(y) - oy,
                 self.s(w),
                 self.s(h),
-                self.w.hwnd,
+                parent,
                 id as isize as HMENU,
                 GetModuleHandleW(std::ptr::null()),
                 std::ptr::null(),
             )
         };
         unsafe { SendMessageW(hwnd, WM_SETFONT, self.w.font as usize, 0) };
-        self.w.pages.push((hwnd, self.page));
         if let Some(tip) = tip {
             self.tip(hwnd, t(tip));
         }
@@ -239,7 +248,7 @@ impl Builder<'_> {
         let mut ti: TTTOOLINFOW = unsafe { std::mem::zeroed() };
         ti.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
         ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-        ti.hwnd = self.w.hwnd;
+        ti.hwnd = unsafe { GetParent(ctl) };
         ti.uId = ctl as usize;
         ti.lpszText = text.as_mut_ptr(); // copied by the tooltip control
         unsafe { SendMessageW(self.w.tooltip, TTM_ADDTOOLW, 0, &ti as *const _ as LPARAM) };
@@ -361,6 +370,16 @@ fn register_classes() {
             ..std::mem::zeroed()
         };
         RegisterClassW(&wc);
+        let page = wide(PAGE_CLASS);
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(page_proc),
+            hInstance: hinst,
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+            lpszClassName: page.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&wc);
         let meter = wide(METER_CLASS);
         let wc = WNDCLASSW {
             lpfnWndProc: Some(meter_proc),
@@ -374,6 +393,18 @@ fn register_classes() {
 }
 
 const SETTINGS_CLASS: &str = "MicNoiseCancelSettings";
+const PAGE_CLASS: &str = "MicNoiseCancelPage";
+
+/// A tab page: paints its background and hands everything its controls
+/// report on to the settings window, which handles all of it in one place.
+unsafe extern "system" fn page_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND | WM_HSCROLL | WM_NOTIFY | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            SendMessageW(GetParent(hwnd), msg, wparam, lparam)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
 
 /// The window's two fonts. Made once and kept for the life of the process:
 /// two small GDI objects, and no risk of freeing one a control still uses.
@@ -507,7 +538,8 @@ impl App {
             apply_pending: false,
             scale,
             tab: std::ptr::null_mut(),
-            pages: Vec::new(),
+            page_windows: [std::ptr::null_mut(); 2],
+            page_origin: [(0, 0); 2],
             status: std::ptr::null_mut(),
             status_hint: std::ptr::null_mut(),
             status_text: Default::default(),
@@ -548,11 +580,12 @@ impl App {
 
     fn show_tab(&mut self, tab: usize) {
         let Some(s) = &self.settings else { return };
-        unsafe { SendMessageW(s.tab, TCM_SETCURSEL, tab, 0) };
-        for &(hwnd, page) in &s.pages {
-            let visible = page == ALWAYS || page as usize == tab;
-            let visible = visible && !(hwnd == s.cable_button && !s.cable_missing);
-            unsafe { ShowWindow(hwnd, if visible { SW_SHOW } else { SW_HIDE }) };
+        unsafe {
+            SendMessageW(s.tab, TCM_SETCURSEL, tab, 0);
+            // Show the new page before hiding the old one, so the area is
+            // never briefly empty.
+            ShowWindow(s.page_windows[tab.min(1)], SW_SHOW);
+            ShowWindow(s.page_windows[1 - tab.min(1)], SW_HIDE);
         }
     }
 
@@ -650,8 +683,7 @@ impl App {
         };
         CABLE_COLOR.with(|c| c.set(colour));
         set_text(s.cable_hint, &text);
-        let on_general = unsafe { SendMessageW(s.tab, TCM_GETCURSEL, 0, 0) } == GENERAL as isize;
-        unsafe { ShowWindow(s.cable_button, if s.cable_missing && on_general { SW_SHOW } else { SW_HIDE }) };
+        unsafe { ShowWindow(s.cable_button, if s.cable_missing { SW_SHOW } else { SW_HIDE }) };
     }
 
     fn refresh_shortcut_button(&mut self) {
@@ -754,6 +786,33 @@ fn build_controls(w: &mut SettingsWindow) {
     }
     b.w.tab = tab;
 
+    // The page windows fill the tab's display area exactly.
+    unsafe {
+        let mut rc: RECT = std::mem::zeroed();
+        GetClientRect(tab, &mut rc);
+        SendMessageW(tab, TCM_ADJUSTRECT, 0, &mut rc as *mut _ as LPARAM);
+        let (tx, ty) = (b.s(10), b.s(tab_y));
+        let (px, py) = (tx + rc.left, ty + rc.top);
+        let class = wide(PAGE_CLASS);
+        for i in 0..2 {
+            b.w.page_windows[i] = CreateWindowExW(
+                WS_EX_CONTROLPARENT, // Tab moves into its controls
+                class.as_ptr(),
+                std::ptr::null(),
+                WS_CHILD | WS_CLIPSIBLINGS | if i == 0 { WS_VISIBLE } else { 0 },
+                px,
+                py,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                b.w.hwnd,
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null(),
+            );
+            b.w.page_origin[i] = (px, py);
+        }
+    }
+
     let x0 = 24;
     let gw = cw - 48; // group width
     let ix = x0 + 12; // inside a group
@@ -841,8 +900,11 @@ fn build_controls(w: &mut SettingsWindow) {
     b.button(t(S::ActionClose), cw - 16 - 110, by, 110, ID_CLOSE, S::HelpClose);
 
     // Children created first sit on top of the z-order. Push the frames -
-    // group boxes, then the tab control under everything - to the bottom,
-    // so with WS_CLIPSIBLINGS they can never paint over what they frame.
+    // group boxes within their page, and the tab control under the pages -
+    // to the bottom, so with WS_CLIPSIBLINGS they never paint over what they
+    // frame. The pages themselves do not clip their children: they erase
+    // their whole area, group-box interiors included, before the controls
+    // draw on top.
     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
     for &g in &b.w.groups {
         unsafe { SetWindowPos(g, HWND_BOTTOM, 0, 0, 0, 0, flags) };
