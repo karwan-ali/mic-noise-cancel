@@ -2,11 +2,15 @@ name: Build
 
 on:
   push:
+    branches: ["**"]
   pull_request:
+  # Publishing a release on GitHub builds the exe and attaches it.
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # attaching the exe to a published release
 
 jobs:
   windows:
@@ -61,6 +65,17 @@ jobs:
         with:
           name: MicNoiseCancel
           path: target/release/MicNoiseCancel.exe
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ($tag.TrimStart('v') -ne $version) { throw "Release tag $tag does not match Cargo.toml version $version" }
+          gh release upload $tag target/release/MicNoiseCancel.exe --clobber
 
       - uses: actions/upload-artifact@v4
         if: always()
