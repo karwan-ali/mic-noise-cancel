@@ -7,7 +7,14 @@ on:
   # Publishing a release on GitHub builds the exe and attaches it.
   release:
     types: [published]
+  # Run by hand with "release" ticked to tag the commit as v<version> and
+  # publish a release with the exe attached.
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a release for the version in Cargo.toml
+        type: boolean
+        default: false
 
 permissions:
   contents: write # attaching the exe to a published release
@@ -76,6 +83,15 @@ jobs:
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           if ($tag.TrimStart('v') -ne $version) { throw "Release tag $tag does not match Cargo.toml version $version" }
           gh release upload $tag target/release/MicNoiseCancel.exe --clobber
+
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch' && inputs.release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          gh release create "v$version" target/release/MicNoiseCancel.exe --target $env:GITHUB_SHA --title "Mic Noise Cancel $version" --generate-notes
 
       - uses: actions/upload-artifact@v4
         if: always()
