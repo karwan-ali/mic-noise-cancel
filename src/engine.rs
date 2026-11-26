@@ -8,8 +8,11 @@
 //! minutes.
 //!
 //! The enhancer runs inside the input callback: a 10 ms hop costs well under a
-//! millisecond, and keeping it there avoids an extra thread. Everything the
-//! callbacks touch is allocated when the streams open, never while they run.
+//! millisecond, and keeping it there avoids an extra thread. DeepFilterNet is
+//! the exception: its model cannot live on an audio thread, so when it is
+//! selected the callback hands the samples to a worker thread that runs the
+//! whole chain (see `neural`). Everything the callbacks touch is allocated
+//! when the streams open, never while they run.
 //!
 //! The engine itself lives on the UI thread. The callbacks talk to it only
 //! through atomics in `Shared`.
@@ -19,12 +22,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
-use nnnoiseless::DenoiseState;
 
 use crate::config::Config;
 use crate::devices::{self, Kind};
 use crate::dsp::{db_to_lin, rms_db, SpeechEnhancer};
 use crate::i18n::{t, tf, S};
+use crate::neural::{DeepFilter, DeepFilterWorker, Denoiser, FeedHandle, NeuralModel};
 use crate::resample::LinearResampler;
 use crate::ring::AudioRing;
 use crate::{log_error, log_info, log_warn};
@@ -33,8 +36,8 @@ pub const PROC_RATE: u32 = 48000;
 pub const PROC_HOP: usize = 480; // 10 ms
 const TARGET_LATENCY_MS: f32 = 40.0;
 const MAX_LATENCY_MS: f32 = 110.0;
-const RNNOISE_SCALE: f32 = 32768.0; // RNNoise works on int16-ranged floats
 const MAX_RESTARTS: u32 = 5;
+const _: () = assert!(PROC_HOP == crate::neural::HOP);
 
 /// A failure the user should read. Rendered when shown, not when raised, so
 /// an error already on screen follows a language switch.
@@ -112,7 +115,9 @@ pub struct Status {
     pub in_level_db: f32,
     pub out_level_db: f32,
     pub speech: bool,
-    pub rnnoise: bool,
+    /// The first stage actually running, which can differ from the setting
+    /// if DeepFilterNet failed to load.
+    pub neural: NeuralModel,
     pub info: Info,
 }
 
@@ -131,7 +136,10 @@ pub struct Engine {
     running: bool,
     error: Option<EngineError>,
     info: Info,
-    rnnoise: bool,
+    neural: NeuralModel,
+    /// Started when DeepFilterNet is first needed and kept while it stays
+    /// selected, so reopening the streams does not load the model again.
+    deepfilter: Option<DeepFilterWorker>,
     restarts: u32,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -157,7 +165,8 @@ impl Engine {
             running: false,
             error: None,
             info: Info::default(),
-            rnnoise: false,
+            neural: NeuralModel::Off,
+            deepfilter: None,
             restarts: 0,
             wake,
         }
@@ -179,7 +188,7 @@ impl Engine {
             in_level_db: self.shared.in_level_db.get(),
             out_level_db: self.shared.out_level_db.get(),
             speech: self.shared.speech.load(Ordering::Relaxed),
-            rnnoise: self.rnnoise,
+            neural: self.neural,
             info: self.info.clone(),
         }
     }
@@ -193,13 +202,13 @@ impl Engine {
             Ok(()) => {
                 self.running = true;
                 log_info!(
-                    "Audio started: {} ({} Hz) -> {} ({} Hz), monitor {:?}, RNNoise {}",
+                    "Audio started: {} ({} Hz) -> {} ({} Hz), monitor {:?}, neural stage {}",
                     self.info.input_name,
                     self.info.input_rate,
                     self.info.output_name,
                     self.info.output_rate,
                     self.info.monitor_name,
-                    self.rnnoise
+                    self.neural
                 );
                 true
             }
@@ -238,16 +247,22 @@ impl Engine {
             || self.cfg.output_device != cfg.output_device
             || self.cfg.monitor_device != cfg.monitor_device
             || self.cfg.monitor_enabled != cfg.monitor_enabled;
-        let rnnoise_changed = self.cfg.use_rnnoise != cfg.use_rnnoise;
+        let neural_changed = self.cfg.neural_model() != cfg.neural_model();
         self.cfg = cfg.clone();
 
         *lock(&self.shared.params) = cfg.enhancer_params();
         self.shared.params_dirty.store(true, Ordering::Release);
         self.shared.bypass.store(!cfg.enabled, Ordering::Relaxed);
         self.shared.monitor_gain.set(db_to_lin(cfg.monitor_gain_db));
+        if let Some(w) = &self.deepfilter {
+            w.set_atten_lim(cfg.deepfilter_limit_db);
+        }
 
-        if routing_changed || (rnnoise_changed && self.running) {
+        if routing_changed || (neural_changed && self.running) {
             self.restart();
+        }
+        if cfg.neural_model() != NeuralModel::DeepFilterNet && self.deepfilter.take().is_some() {
+            log_info!("DeepFilterNet unloaded"); // its thread and memory go with it
         }
     }
 
@@ -315,8 +330,15 @@ impl Engine {
             None => None,
         };
 
-        let rnnoise = self.cfg.use_rnnoise.then(DenoiseState::new);
-        self.rnnoise = rnnoise.is_some();
+        let use_deepfilter = self.cfg.neural_model() == NeuralModel::DeepFilterNet && self.ensure_deepfilter();
+        let denoiser = match self.cfg.neural_model() {
+            NeuralModel::Off => Denoiser::off(),
+            NeuralModel::DeepFilterNet if use_deepfilter => Denoiser::off(), // the worker runs it
+            // RNNoise stands in when DeepFilterNet could not be loaded, so
+            // the user still gets a neural stage.
+            _ => Denoiser::rnnoise(),
+        };
+        self.neural = if use_deepfilter { NeuralModel::DeepFilterNet } else { denoiser.model() };
 
         let mut sinks = vec![Sink::new(out.ring.clone(), out.rate, false)];
         if let Some(m) = &mon {
@@ -324,19 +346,29 @@ impl Engine {
         }
 
         let params = *lock(&self.shared.params);
-        let proc = InputProc {
-            channels: 1,
-            mono: Vec::with_capacity(PROC_RATE as usize / 10),
-            resampler: LinearResampler::new(PROC_RATE, PROC_RATE),
+        let mut processor = Processor {
             pending: Vec::with_capacity(PROC_RATE as usize / 5),
             enhancer: SpeechEnhancer::new(PROC_RATE, PROC_HOP, params),
-            rnnoise,
-            rn_buf: [0.0; PROC_HOP],
+            denoiser,
             hop: [0.0; PROC_HOP],
             sinks,
             shared: self.shared.clone(),
         };
-        let (input, in_rate) = open_input(&in_dev, &in_name, proc, self.shared.clone(), self.wake.clone())?;
+        let target = match self.deepfilter.as_mut().filter(|_| use_deepfilter) {
+            Some(worker) => {
+                worker.set_atten_lim(self.cfg.deepfilter_limit_db);
+                Target::Worker(worker.attach(Box::new(move |samples, df| processor.push(samples, Some(df)))))
+            }
+            None => Target::Inline(Box::new(processor)),
+        };
+        let capture = Capture {
+            channels: 1,
+            mono: Vec::with_capacity(PROC_RATE as usize / 10),
+            resampler: LinearResampler::new(PROC_RATE, PROC_RATE),
+            resampled: Vec::with_capacity(PROC_RATE as usize / 5),
+            target,
+        };
+        let (input, in_rate) = open_input(&in_dev, &in_name, capture, self.shared.clone(), self.wake.clone())?;
 
         for stream in [Some(&out.stream), mon.as_ref().map(|m| &m.stream), Some(&input)].into_iter().flatten() {
             stream.play().map_err(|e| EngineError::OpenOutput { device: out_name.clone(), error: e.to_string() })?;
@@ -349,7 +381,7 @@ impl Engine {
             monitor_name: mon.as_ref().and(monitor.map(|(n, _)| n)),
             input_rate: in_rate,
             output_rate: out.rate,
-            latency_ms: TARGET_LATENCY_MS + 1000.0 * (PROC_HOP * 2) as f32 / PROC_RATE as f32,
+            latency_ms: TARGET_LATENCY_MS + 1000.0 * (PROC_HOP * 2) as f32 / PROC_RATE as f32 + self.extra_latency_ms(),
         };
         self.streams = Some(Streams {
             _input: input,
@@ -358,6 +390,33 @@ impl Engine {
             out_ring: out.ring,
         });
         Ok(())
+    }
+
+    /// Start the DeepFilterNet worker unless it already runs. False if the
+    /// model could not be loaded.
+    fn ensure_deepfilter(&mut self) -> bool {
+        if self.deepfilter.is_none() {
+            let start = std::time::Instant::now();
+            match DeepFilterWorker::start() {
+                Ok(w) => {
+                    log_info!("DeepFilterNet loaded in {:.0?}, {:.0} ms delay", start.elapsed(), w.delay_ms());
+                    self.deepfilter = Some(w);
+                }
+                Err(e) => log_error!("DeepFilterNet could not be loaded, using RNNoise: {e}"),
+            }
+        }
+        self.deepfilter.is_some()
+    }
+
+    /// The base latency figure counts one hop for the first stage, which is
+    /// what RNNoise takes. DeepFilterNet looks further ahead.
+    fn extra_latency_ms(&self) -> f32 {
+        match (&self.deepfilter, self.neural) {
+            (Some(w), NeuralModel::DeepFilterNet) => {
+                (w.delay_ms() - 1000.0 * PROC_HOP as f32 / PROC_RATE as f32).max(0.0)
+            }
+            _ => 0.0,
+        }
     }
 
     fn teardown(&mut self) {
@@ -372,9 +431,13 @@ impl Engine {
             );
         }
         // The input stream is declared first in Streams, so it stops before
-        // the outputs it feeds.
+        // the outputs it feeds. With nothing feeding it any more, the
+        // DeepFilterNet worker can drop its chain.
         self.streams = None;
-        self.rnnoise = false;
+        if let Some(w) = &mut self.deepfilter {
+            w.detach();
+        }
+        self.neural = NeuralModel::Off;
         self.shared.in_level_db.set(-120.0);
         self.shared.out_level_db.set(-120.0);
         self.shared.speech.store(false, Ordering::Relaxed);
@@ -408,21 +471,23 @@ impl Sink {
     }
 }
 
+/// Where captured audio goes: straight through the chain inside the
+/// callback, or over to the DeepFilterNet worker, which runs the chain there.
+enum Target {
+    Inline(Box<Processor>),
+    Worker(FeedHandle),
+}
+
 /// Everything the input callback owns.
-struct InputProc {
+struct Capture {
     channels: usize,
     mono: Vec<f32>,
     resampler: LinearResampler,
-    pending: Vec<f32>,
-    enhancer: SpeechEnhancer,
-    rnnoise: Option<Box<DenoiseState<'static>>>,
-    rn_buf: [f32; PROC_HOP],
-    hop: [f32; PROC_HOP],
-    sinks: Vec<Sink>,
-    shared: Arc<Shared>,
+    resampled: Vec<f32>,
+    target: Target,
 }
 
-impl InputProc {
+impl Capture {
     fn push<T>(&mut self, data: &[T])
     where
         T: Sample,
@@ -441,18 +506,39 @@ impl InputProc {
                     .map(|f| f.iter().map(|s| f32::from_sample(*s)).sum::<f32>() * scale),
             );
         }
-        self.resampler.process(&self.mono, &mut self.pending);
+        self.resampled.clear();
+        self.resampler.process(&self.mono, &mut self.resampled);
+        match &mut self.target {
+            Target::Inline(p) => p.push(&self.resampled, None),
+            Target::Worker(feed) => feed.push(&self.resampled),
+        }
+    }
+}
 
+/// The processing chain from 48 kHz mono to the output rings.
+struct Processor {
+    pending: Vec<f32>,
+    enhancer: SpeechEnhancer,
+    denoiser: Denoiser,
+    hop: [f32; PROC_HOP],
+    sinks: Vec<Sink>,
+    shared: Arc<Shared>,
+}
+
+impl Processor {
+    /// `deepfilter` is the worker's stage, when this runs on the worker.
+    fn push(&mut self, samples: &[f32], mut deepfilter: Option<&mut DeepFilter>) {
+        self.pending.extend_from_slice(samples);
         let mut offset = 0;
         while self.pending.len() - offset >= PROC_HOP {
             self.hop.copy_from_slice(&self.pending[offset..offset + PROC_HOP]);
             offset += PROC_HOP;
-            self.process_hop();
+            self.process_hop(deepfilter.as_deref_mut());
         }
         self.pending.drain(..offset);
     }
 
-    fn process_hop(&mut self) {
+    fn process_hop(&mut self, deepfilter: Option<&mut DeepFilter>) {
         let shared = &*self.shared;
         if shared.params_dirty.swap(false, Ordering::Acquire) {
             // try_lock: the UI holds it for a single copy, and if we miss it
@@ -469,14 +555,9 @@ impl InputProc {
             shared.out_level_db.set(level);
             shared.speech.store(false, Ordering::Relaxed);
         } else {
-            if let Some(rn) = self.rnnoise.as_mut() {
-                for s in self.hop.iter_mut() {
-                    *s *= RNNOISE_SCALE;
-                }
-                rn.process_frame(&mut self.rn_buf, &self.hop);
-                for (d, s) in self.hop.iter_mut().zip(&self.rn_buf) {
-                    *d = s / RNNOISE_SCALE;
-                }
+            match deepfilter {
+                Some(df) => df.process(&mut self.hop),
+                None => self.denoiser.process(&mut self.hop),
             }
             self.enhancer.process(&mut self.hop);
             shared.in_level_db.set(self.enhancer.in_level_db);
@@ -511,7 +592,7 @@ fn error_callback(shared: Arc<Shared>, wake: Arc<dyn Fn() + Send + Sync>, what: 
 fn open_input(
     dev: &cpal::Device,
     name: &str,
-    mut proc: InputProc,
+    mut proc: Capture,
     shared: Arc<Shared>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<(cpal::Stream, u32), EngineError> {
@@ -527,7 +608,7 @@ fn open_input(
     fn build<T>(
         dev: &cpal::Device,
         config: StreamConfig,
-        mut proc: InputProc,
+        mut proc: Capture,
         err: impl FnMut(cpal::Error) + Send + 'static,
     ) -> Result<cpal::Stream, cpal::Error>
     where

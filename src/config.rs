@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::dsp::EnhancerParams;
+use crate::neural::NeuralModel;
 
 pub const APP_NAME: &str = "MicNoiseCancel";
 pub const APP_TITLE: &str = "Mic Noise Cancel";
@@ -41,6 +42,11 @@ pub struct Config {
     pub input_gain_db: f32,
     pub makeup_gain_db: f32,
     pub use_rnnoise: bool,
+    /// DeepFilterNet replaces RNNoise as the first stage when on. A separate
+    /// flag rather than a new enum, so older files keep their meaning.
+    pub use_deepfilternet: bool,
+    /// How far DeepFilterNet may push noise down; 100 dB means no limit.
+    pub deepfilter_limit_db: f32,
 }
 
 impl Default for Config {
@@ -67,6 +73,8 @@ impl Default for Config {
             input_gain_db: 0.0,
             makeup_gain_db: 0.0,
             use_rnnoise: true,
+            use_deepfilternet: false,
+            deepfilter_limit_db: 100.0,
         }
     }
 }
@@ -135,6 +143,28 @@ impl Config {
             input_gain_db: self.input_gain_db,
             makeup_gain_db: self.makeup_gain_db,
             gate_enabled: self.gate_enabled,
+        }
+    }
+
+    /// The network that runs before the app's own noise reduction.
+    pub fn neural_model(&self) -> NeuralModel {
+        if self.use_deepfilternet {
+            NeuralModel::DeepFilterNet
+        } else if self.use_rnnoise {
+            NeuralModel::RNNoise
+        } else {
+            NeuralModel::Off
+        }
+    }
+
+    pub fn set_neural_model(&mut self, model: NeuralModel) {
+        self.use_deepfilternet = model == NeuralModel::DeepFilterNet;
+        // RNNoise's flag is left alone under DeepFilterNet: switching back
+        // from it to "RNNoise" then sets it again anyway.
+        match model {
+            NeuralModel::Off => self.use_rnnoise = false,
+            NeuralModel::RNNoise => self.use_rnnoise = true,
+            NeuralModel::DeepFilterNet => {}
         }
     }
 
@@ -246,9 +276,27 @@ mod tests {
     }
 
     #[test]
+    fn neural_model_round_trips_and_old_files_keep_their_meaning() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.neural_model(), NeuralModel::RNNoise);
+        for m in NeuralModel::ALL {
+            cfg.set_neural_model(m);
+            assert_eq!(cfg.neural_model(), m);
+        }
+        // Written before DeepFilterNet existed.
+        let old = Config::from_json(r#"{ "use_rnnoise": false }"#);
+        assert_eq!(old.neural_model(), NeuralModel::Off);
+        assert_eq!(old.deepfilter_limit_db, 100.0);
+        let dfn = Config::from_json(r#"{ "use_rnnoise": true, "use_deepfilternet": true }"#);
+        assert_eq!(dfn.neural_model(), NeuralModel::DeepFilterNet);
+    }
+
+    #[test]
     fn serialises_back() {
         let mut cfg = Config::default();
         cfg.input_device = Some("Mic \"quoted\" ö".into());
+        cfg.set_neural_model(NeuralModel::DeepFilterNet);
+        cfg.deepfilter_limit_db = 24.0;
         let text = serde_json::to_string_pretty(&cfg).unwrap();
         assert_eq!(Config::from_json(&text), cfg);
     }

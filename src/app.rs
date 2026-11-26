@@ -27,6 +27,7 @@ use crate::devices::{self, Kind};
 use crate::engine::Engine;
 use crate::i18n::{self, t, tf, Lang, S};
 use crate::icon_draw::IconState;
+use crate::neural::NeuralModel;
 use crate::settings::{self, SettingsWindow};
 use crate::tray::{Tray, WM_TRAY};
 use crate::win::{self, wide};
@@ -47,6 +48,7 @@ const CMD_QUIT: u32 = 5;
 const CMD_MORE: u32 = 6;
 const CMD_PRESET: u32 = 10;
 const CMD_LANG: u32 = 20;
+const CMD_NEURAL: u32 = 30;
 const CMD_INPUT: u32 = 100;
 const CMD_OUTPUT: u32 = 200;
 
@@ -182,6 +184,15 @@ impl App {
         self.update_config(cfg);
     }
 
+    fn set_neural_model(&mut self, model: NeuralModel) {
+        let mut cfg = self.cfg.clone();
+        cfg.set_neural_model(model);
+        self.update_config(cfg);
+        // An open settings window would otherwise put its old choice back
+        // the next time it applies.
+        self.load_values();
+    }
+
     fn set_device(&mut self, kind: Kind, name: String) {
         let mut cfg = self.cfg.clone();
         match kind {
@@ -246,6 +257,14 @@ impl App {
                 CheckMenuRadioItem(presets, CMD_PRESET, CMD_PRESET + 2, id, MF_BYCOMMAND);
             }
             append_popup(menu, presets, t(S::TrayLevel));
+
+            let models = CreatePopupMenu();
+            for (i, m) in NeuralModel::ALL.into_iter().enumerate() {
+                append(models, 0, CMD_NEURAL + i as u32, t(neural_label(m)));
+            }
+            let current = NeuralModel::ALL.iter().position(|&m| m == self.cfg.neural_model()).unwrap_or(0) as u32;
+            CheckMenuRadioItem(models, CMD_NEURAL, CMD_NEURAL + 2, CMD_NEURAL + current, MF_BYCOMMAND);
+            append_popup(menu, models, t(S::TrayNeural));
             append(menu, MF_SEPARATOR, 0, "");
 
             self.menu_inputs = devices::names(Kind::Input);
@@ -283,6 +302,9 @@ impl App {
             CMD_QUIT => return true,
             c if (CMD_PRESET..CMD_PRESET + 3).contains(&c) => self.set_preset(Preset::ALL[(c - CMD_PRESET) as usize]),
             c if (CMD_LANG..CMD_LANG + 2).contains(&c) => self.set_language(Lang::ALL[(c - CMD_LANG) as usize]),
+            c if (CMD_NEURAL..CMD_NEURAL + 3).contains(&c) => {
+                self.set_neural_model(NeuralModel::ALL[(c - CMD_NEURAL) as usize])
+            }
             c if (CMD_INPUT..CMD_OUTPUT).contains(&c) => {
                 if let Some(name) = self.menu_inputs.get((c - CMD_INPUT) as usize).cloned() {
                     self.set_device(Kind::Input, name);
@@ -308,6 +330,14 @@ impl App {
                 self.settings = None;
             }
         }
+    }
+}
+
+pub fn neural_label(m: NeuralModel) -> S {
+    match m {
+        NeuralModel::Off => S::NeuralOff,
+        NeuralModel::RNNoise => S::NeuralRnnoise,
+        NeuralModel::DeepFilterNet => S::NeuralDeepFilterNet,
     }
 }
 
