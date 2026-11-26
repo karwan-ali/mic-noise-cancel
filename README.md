@@ -155,8 +155,10 @@ Esc or *Close* closes the window; the app keeps running in the tray.
 - **There's a click when the gate opens:** raise *Attack* to 15-20 ms.
 - **Barking, clatter or chatter gets through:** pick *DeepFilterNet* as the
   neural network.
-- **The voice sounds thin or robotic with DeepFilterNet:** lower *Max
-  reduction (DFN)* to 20-30 dB, so a little of the room is left in.
+- **With DeepFilterNet the room sounds unnaturally dead:** lower *Max
+  reduction (DFN)* to 20-30 dB, so a little of it is left in.
+- **The voice is distorted with DeepFilterNet as soon as *Max reduction* goes
+  above 6 dB:** that was a bug in 2.1.0, fixed in 2.1.1. Update the app.
 
 ---
 
@@ -215,8 +217,10 @@ or in the tray menu:
 by Hendrik Schröter, a much larger network, run with the
 [tract](https://github.com/sonos/tract) inference engine. The model ships
 inside the .exe, so there's still nothing extra to download. On the test
-suite's synthetic speech it takes the background down by 26-29 dB on its own,
-with speech within 1-4 dB of the clean signal. The app's own noise reduction
+suite's synthetic speech it takes the background down by 23 dB on its own,
+with speech within 0.5 dB of the clean signal. On a real recording of speech in
+0 dB noise it lowers the pauses by about 30 dB and lifts SI-SDR from 6 to 20 dB
+(RNNoise: 16 dB). The app's own noise reduction
 and gate still run after it. *Max reduction (DFN)* caps how far it pushes the
 noise down: at 100 dB there's no cap, and 20-30 dB leaves a trace of the room,
 which some people find sounds more natural. The slider works while you talk.
@@ -285,7 +289,9 @@ cargo test --release
   limiter, live parameter changes, and robustness against silence and
   overdriven input.
 - **Neural networks:** DeepFilterNet loads, removes noise and keeps speech in
-  both rooms, respects its attenuation limit (also when it changes mid-stream),
+  both rooms, never mutes a frame or skips a stage, leaves loud speech
+  undistorted at full attenuation, respects its attenuation limit (also when it
+  changes mid-stream),
   survives silence and full-scale input, and runs well faster than real time.
   Its worker thread runs back-to-back sessions, delivers every block, drops
   audio rather than growing if it falls behind, and shuts down cleanly.
