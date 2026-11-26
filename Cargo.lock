@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "mic-noise-cancel"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cpal",
  "deep_filter",
