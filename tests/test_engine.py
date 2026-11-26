@@ -67,6 +67,52 @@ check("find_by_name tolerates nonsense", devices.find_by_name("input", "no such 
 check("virtual sink detection", devices.is_virtual_sink("CABLE Input (VB-Audio Virtual Cable)"))
 check("virtual sink negative", not devices.is_virtual_sink("Realtek Speakers"))
 check("voicemeeter recognised", devices.is_virtual_sink("VoiceMeeter Input (VB-Audio)"))
+
+# A typical Windows box as PortAudio reports it: every device once per host
+# API, MME names cut at 31 chars, plus the MME/DirectSound pseudo-devices.
+_fake_apis = [{"name": n} for n in ("MME", "Windows DirectSound", "Windows WASAPI", "Windows WDM-KS")]
+def _fd(name, api, i, o):
+    return {"name": name, "hostapi": api, "max_input_channels": i,
+            "max_output_channels": o, "default_samplerate": 48000.0}
+_fake_devs = [
+    _fd("Microsoft Sound Mapper - Input", 0, 2, 0),
+    _fd("Mikrofon (Realtek High Definit", 0, 2, 0),
+    _fd("Microsoft Sound Mapper - Output", 0, 0, 2),
+    _fd("H\u00f6gtalare (Realtek High Defin", 0, 0, 2),
+    _fd("Primary Sound Capture Driver", 1, 2, 0),
+    _fd("Mikrofon (Realtek High Definition Audio)", 1, 2, 0),
+    _fd("Primary Sound Driver", 1, 0, 2),
+    _fd("H\u00f6gtalare (Realtek High Definition Audio)", 1, 0, 2),
+    _fd("Mikrofon (Realtek High Definition Audio)", 2, 2, 0),
+    _fd("H\u00f6gtalare (Realtek High Definition Audio)", 2, 0, 2),
+    _fd("CABLE Input (VB-Audio Virtual Cable)", 2, 0, 2),
+    _fd("Speakers (Realtek HD Audio output)", 3, 0, 2),
+    _fd("Stereo Mix (Realtek HD Audio Stereo input)", 3, 2, 0),
+]
+_real_qd, _real_qh = devices.sd.query_devices, devices.sd.query_hostapis
+devices.sd.query_devices = lambda *a, **k: _fake_devs
+devices.sd.query_hostapis = lambda *a, **k: _fake_apis
+try:
+    devices._cache.clear()
+    win_in = [d.name for d in devices.list_devices("input")]
+    win_out = [d.name for d in devices.list_devices("output")]
+    check("windows: only WASAPI inputs listed", win_in == ["Mikrofon (Realtek High Definition Audio)"])
+    check("windows: only WASAPI outputs listed",
+          sorted(win_out) == sorted(["CABLE Input (VB-Audio Virtual Cable)",
+                                     "H\u00f6gtalare (Realtek High Definition Audio)"]))
+    # Without WASAPI: fall back to the rest, merging truncated MME names.
+    _fake_devs[:] = [d for d in _fake_devs if d["hostapi"] != 2]
+    devices._cache.clear()
+    fb_in = devices.list_devices("input")
+    check("fallback: pseudo-devices dropped", not any("mapper" in d.name.lower()
+          or "primary" in d.name.lower() for d in fb_in))
+    check("fallback: truncated MME name merged with full name",
+          [d.name for d in fb_in if d.name.startswith("Mikrofon")]
+          == ["Mikrofon (Realtek High Definition Audio)"])
+finally:
+    devices.sd.query_devices, devices.sd.query_hostapis = _real_qd, _real_qh
+    devices._cache.clear()
+
 fresh = {"input_device": None, "output_device": None, "monitor_device": None}
 devices.suggest_defaults(fresh)
 print("  suggested: in=%r out=%r monitor=%r"

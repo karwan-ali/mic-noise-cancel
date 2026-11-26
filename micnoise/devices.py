@@ -72,11 +72,45 @@ def _hostapi_rank(name):
         return len(_HOSTAPI_PREFERENCE)
 
 
-def list_devices(kind):
-    """List input or output devices, best host API first, duplicates removed.
+# Entries MME and DirectSound invent on top of the real hardware. They are not
+# devices of their own, just "whatever the default is", so they only add noise.
+_PSEUDO_DEVICES = (
+    "microsoft sound mapper",
+    "primary sound driver",
+    "primary sound capture driver",
+)
 
-    PortAudio reports the same physical device once per host API. We keep the
-    entry from the most preferred API so the menus stay readable.
+# MME cuts device names off at 31 characters (32 including the terminator).
+_MME_NAME_LIMIT = 31
+
+
+def _is_pseudo(name):
+    lowered = name.lower()
+    return any(lowered.startswith(p) for p in _PSEUDO_DEVICES)
+
+
+def _same_device(a, b):
+    """True if two names from different host APIs refer to the same device.
+
+    MME truncates long names, so "Speakers (Realtek High Definition Audio)"
+    also shows up as "Speakers (Realtek High Definit".
+    """
+    a, b = a.lower(), b.lower()
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= _MME_NAME_LIMIT - 1 and long_.startswith(short)
+
+
+def list_devices(kind):
+    """List input or output devices the way Windows' Sound settings shows them.
+
+    PortAudio reports each physical device once per host API (MME, DirectSound,
+    WASAPI, WDM-KS), under slightly different names, plus a few pseudo-devices.
+    WASAPI's list matches what Windows itself shows, so when WASAPI has any
+    devices of this kind we use only those. Otherwise (no WASAPI, or not on
+    Windows) we fall back to every host API and merge duplicates, keeping the
+    entry from the most preferred API.
     """
     assert kind in ("input", "output")
     cached = _cache.get(kind)
@@ -91,26 +125,36 @@ def list_devices(kind):
         log.exception("Device enumeration failed")
         return []
 
-    best = {}
+    candidates = []
     for idx, info in enumerate(raw):
         channels = info["max_input_channels"] if want_input else info["max_output_channels"]
         if channels < 1:
             continue
+        name = info["name"].strip()
+        if not name or _is_pseudo(name):
+            continue
         api_name = apis[info["hostapi"]]["name"] if info["hostapi"] < len(apis) else "?"
-        dev = Device(
+        candidates.append(Device(
             index=idx,
-            name=info["name"].strip(),
+            name=name,
             hostapi=api_name,
             channels=channels,
             samplerate=int(info.get("default_samplerate") or 48000),
             is_input=want_input,
-        )
-        key = dev.name.lower()
-        current = best.get(key)
-        if current is None or _hostapi_rank(api_name) < _hostapi_rank(current.hostapi):
-            best[key] = dev
+        ))
 
-    found = sorted(best.values(), key=lambda d: (_hostapi_rank(d.hostapi), d.name.lower()))
+    wasapi = [d for d in candidates if d.hostapi == "Windows WASAPI"]
+    if wasapi:
+        candidates = wasapi
+
+    # Best host API first, so the entry we keep for each device is the best one.
+    candidates.sort(key=lambda d: _hostapi_rank(d.hostapi))
+    found = []
+    for dev in candidates:
+        if not any(_same_device(dev.name, kept.name) for kept in found):
+            found.append(dev)
+
+    found.sort(key=lambda d: (_hostapi_rank(d.hostapi), d.name.lower()))
     _cache[kind] = (time.monotonic(), found)
     return found
 
