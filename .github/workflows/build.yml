@@ -2,11 +2,13 @@ name: Build
 
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # creating a release on a version tag
 
 jobs:
   windows:
@@ -61,6 +63,18 @@ jobs:
         with:
           name: MicNoiseCancel
           path: target/release/MicNoiseCancel.exe
+
+      # Pushing a tag like v2.0.0 publishes a release with the exe attached.
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $tag) { throw "Tag $tag does not match Cargo.toml version $version" }
+          gh release create $tag target/release/MicNoiseCancel.exe --title "Mic Noise Cancel $version" --generate-notes
 
       - uses: actions/upload-artifact@v4
         if: always()
