@@ -1,0 +1,76 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Rust
+        run: rustup update stable --no-self-update && rustup default stable
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Start the real program, check that it stays up, and report how much
+      # memory it uses. The runner has no sound card, so the app reports
+      # "no microphone" and opens its settings window - which is also what
+      # the screenshot shows.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $exe = "target\release\MicNoiseCancel.exe"
+          "Size: {0:N0} KB" -f ((Get-Item $exe).Length / 1KB)
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) {
+            Get-Content "$env:APPDATA\MicNoiseCancel\app.log" -ErrorAction SilentlyContinue
+            throw "The app exited after start with code $($p.ExitCode)"
+          }
+          $p.Refresh()
+          "With the settings window open: working set {0:N1} MB, private {1:N1} MB" -f ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB)
+
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$PWD\screenshot.png")
+
+          $null = $p.CloseMainWindow()
+          Start-Sleep -Seconds 3
+          if ($p.HasExited) { throw "Closing the settings window ended the app" }
+          $p.Refresh()
+          "In the tray only: working set {0:N1} MB, private {1:N1} MB" -f ($p.WorkingSet64 / 1MB), ($p.PrivateMemorySize64 / 1MB)
+
+          Stop-Process -Id $p.Id
+          "--- app.log ---"
+          Get-Content "$env:APPDATA\MicNoiseCancel\app.log"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicNoiseCancel
+          path: target/release/MicNoiseCancel.exe
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot
+          path: screenshot.png
+          if-no-files-found: ignore
+
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --release --locked
